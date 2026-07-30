@@ -1,0 +1,10 @@
+/*dmesg*
+/*pmap*
+/*perf*
+run-*.sh
+enable-heatmap.sh
+data/*
+svm-predict
+svm-train
+svm-scale
+*.o
