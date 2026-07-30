@@ -1,5 +1,6 @@
-# Change `perf\_cmd` path accordingly in `src/benchmark\_[system]\_[application].h`
-# Run `switch\_bench\_profile.sh [system] [application]` for switching the applicaiton and system for saving perf logs.
+## 1. This is the GAPBS benchmark source code for evaluating PR and CC. The evaluation scripts are in `bench_gapbs_pr` and `bench_gapbs_cc` respectively. 
+## 2. Change `perf_cmd` path accordingly in `src/benchmark_[system]_[application].h`
+## 3. Run `switch_bench_profile.sh [system] [application]` for switching the applicaiton and system for saving perf logs.
 
 # Original GAPBS Description
 ![GAP logo](https://scottbeamer.net/images/gap-logo-horiz.svg)
