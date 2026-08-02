@@ -1,30 +1,127 @@
 #!/bin/bash
-set -x
-
-sync_result() {
-    while true; do
-        local monitor=$(pidof "$1")
-        if [[ -n "$monitor" ]]; then
-            echo "$monitor" # Output the successful PID
-            break
-        fi
-        sleep 1 
-    done
-}
+set -euo pipefail
 
 DATAPATH=$(dirname "$(realpath -e "${BASH_SOURCE[0]:-$0}")")
 DATETIME=$(date +'%m%d%H%M')
 
-taskset -a -c 7 ./db_bench --benchmarks=readrandom2 --num=603979776 --reads=200000000 --value_size=64 --histogram=1 --db=./dbbench_data --use_existing_db=1 &>> ./readrandom.out.$DATETIME.hottlb &
+PERF_SCRIPT="/home/l1/Documents/HotTLB-new-tools/perf-scripts/common-perf-tlbmiss-process.sh"
+PMDMON_DIR="/home/l1/Documents/HotTLB-new-tools/gemini_enable_scripts"
 
-DBBENCH_PID=$(sync_result db_bench)
+PMDMON_START="$PMDMON_DIR/pmdmon_start"
+PMDMON_STOP="$PMDMON_DIR/pmdmon_stop"
 
-/path/to/pmdmon_start db_bench
+DB_PATH="/home/l1/Documents/dbbench_data_64B_speedb"
+OUTPUT_FILE="$DATAPATH/readrandom.out.$DATETIME.hottlb"
 
-datapath=$DATAPATH datetime=$DATETIME /path/to/perf-scripts/common-perf-tlbmiss-process.sh speedb-hottlb db_bench &
+NUM_ENTRIES=1811939328
+THREADS=32
+TOTAL_READS=200000000
+MEASURED_ITERATIONS=20
 
-wait $DBBENCH_PID
+DBBENCH_PID=""
+PERF_SCRIPT_PID=""
+PMDMON_STARTED=0
 
-sudo killall perf
+cleanup() {
+    if [[ -n "$DBBENCH_PID" ]] && kill -0 "$DBBENCH_PID" 2>/dev/null; then
+        kill -TERM "$DBBENCH_PID" 2>/dev/null || true
+        wait "$DBBENCH_PID" 2>/dev/null || true
+    fi
 
-/path/to/pmdmon_stop
+    if [[ -n "$PERF_SCRIPT_PID" ]] && kill -0 "$PERF_SCRIPT_PID" 2>/dev/null; then
+        kill -TERM "$PERF_SCRIPT_PID" 2>/dev/null || true
+        wait "$PERF_SCRIPT_PID" 2>/dev/null || true
+    fi
+
+    if [[ "$PMDMON_STARTED" -eq 1 ]]; then
+        "$PMDMON_STOP" 2>/dev/null || true
+        PMDMON_STARTED=0
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+if [[ ! -x "$DATAPATH/db_bench" ]]; then
+    echo "Speedb binary not found: $DATAPATH/db_bench"
+    exit 1
+fi
+
+if [[ ! -d "$DB_PATH" ]]; then
+    echo "Speedb database not found: $DB_PATH"
+    exit 1
+fi
+
+if [[ ! -x "$PERF_SCRIPT" ]]; then
+    echo "Perf script not found or not executable: $PERF_SCRIPT"
+    exit 1
+fi
+
+if [[ ! -x "$PMDMON_START" ]]; then
+    echo "HotTLB start script not found or not executable: $PMDMON_START"
+    exit 1
+fi
+
+if [[ ! -x "$PMDMON_STOP" ]]; then
+    echo "HotTLB stop script not found or not executable: $PMDMON_STOP"
+    exit 1
+fi
+
+mkdir -p /tmp/enablement
+rm -f /tmp/enablement/speedb_watch
+
+cd "$DATAPATH"
+
+taskset -a -c 0-31 \
+    ./db_bench \
+    --benchmarks=readrandom2 \
+    --num="$NUM_ENTRIES" \
+    --reads="$TOTAL_READS" \
+    --threads="$THREADS" \
+    --value_size=64 \
+    --histogram=1 \
+    --db="$DB_PATH" \
+    --use_existing_db=1 \
+    &>>"$OUTPUT_FILE" &
+
+DBBENCH_PID=$!
+
+echo "Speedb HotTLB started with PID $DBBENCH_PID"
+echo "Database: $DB_PATH"
+echo "Configured entries: $NUM_ENTRIES"
+echo "Working set: 108 GiB"
+echo "Threads: $THREADS"
+echo "Aggregate reads per iteration: $TOTAL_READS"
+echo "Measured iterations: $MEASURED_ITERATIONS"
+echo "Output: $OUTPUT_FILE"
+
+"$PMDMON_START" db_bench
+PMDMON_STARTED=1
+
+datapath="$DATAPATH" \
+datetime="$DATETIME" \
+"$PERF_SCRIPT" speedb-hottlb "$DBBENCH_PID" &
+
+PERF_SCRIPT_PID=$!
+
+set +e
+wait "$DBBENCH_PID"
+DBBENCH_STATUS=$?
+set -e
+
+DBBENCH_PID=""
+
+"$PMDMON_STOP"
+PMDMON_STARTED=0
+
+if [[ -n "$PERF_SCRIPT_PID" ]]; then
+    wait "$PERF_SCRIPT_PID" 2>/dev/null || true
+    PERF_SCRIPT_PID=""
+fi
+
+trap - EXIT INT TERM
+
+echo "Speedb HotTLB exit status: $DBBENCH_STATUS"
+echo "Output: $OUTPUT_FILE"
+echo "Done."
+
+exit "$DBBENCH_STATUS"

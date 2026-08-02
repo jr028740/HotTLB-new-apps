@@ -26,6 +26,7 @@
 #include <numa.h>
 #endif
 #ifndef OS_WIN
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 #include <fcntl.h>
@@ -48,11 +49,14 @@
 #endif
 #include <stdarg.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2878,8 +2882,14 @@ struct SharedState {
   long num_initialized;
   long num_done;
   bool start;
+  int phase_arrived;
+  int phase_generation;
 
-  SharedState() : cv(&mu), perf_level(FLAGS_perf_level) {}
+  SharedState()
+      : cv(&mu),
+        perf_level(FLAGS_perf_level),
+        phase_arrived(0),
+        phase_generation(0) {}
 };
 
 // Per-thread state for concurrent executions of the same benchmark.
@@ -2967,6 +2977,11 @@ class Benchmark {
   bool use_blob_db_;    // Stacked BlobDB
   bool read_operands_;  // read via GetMergeOperands()
   std::vector<std::string> keys_;
+  char* readrandom2_data_;
+  uint64_t readrandom2_entries_;
+  size_t readrandom2_stride_;
+  size_t readrandom2_bytes_;
+  DB* readrandom2_db_;
   uint64_t total_ranges_written_;
   // the next range to delete
   std::atomic<uint64_t> delete_index_;
@@ -3511,6 +3526,11 @@ class Benchmark {
         report_file_operations_(FLAGS_report_file_operations),
         use_blob_db_(FLAGS_use_blob_db),  // Stacked BlobDB
         read_operands_(false),
+        readrandom2_data_(nullptr),
+        readrandom2_entries_(0),
+        readrandom2_stride_(0),
+        readrandom2_bytes_(0),
+        readrandom2_db_(nullptr),
         total_ranges_written_(0),
         delete_index_(FLAGS_num_ranges_to_keep),
         seek_started_(false) {
@@ -3586,6 +3606,7 @@ class Benchmark {
       return;
     }
 
+    ReleaseReadRandom2();
     DeleteDBs();
     if (cache_.get() != nullptr) {
       // Clear cache reference first
@@ -3674,6 +3695,173 @@ class Benchmark {
       // This rely on GenerateKeyFromInt filling paddings with '0's.
       // Putting a '1' will create a non-existing prefix.
       key_ptr[8] = '1';
+    }
+  }
+
+  void ReleaseReadRandom2() {
+    if (readrandom2_data_ != nullptr) {
+      munmap(readrandom2_data_, readrandom2_bytes_);
+    }
+    readrandom2_data_ = nullptr;
+    readrandom2_entries_ = 0;
+    readrandom2_stride_ = 0;
+    readrandom2_bytes_ = 0;
+    readrandom2_db_ = nullptr;
+  }
+
+  void PrepareReadRandom2() {
+    ReleaseReadRandom2();
+
+    if (dbs_to_use_.size() != 1 || dbs_to_use_[0].db == nullptr) {
+      ErrorExit("readrandom2 requires exactly one Speedb database");
+    }
+    if (FLAGS_num <= 0 || FLAGS_value_size <= 0) {
+      ErrorExit("readrandom2 requires positive --num and --value_size");
+    }
+    if (user_timestamp_size_ > 0) {
+      ErrorExit("readrandom2 does not support user timestamps");
+    }
+
+    readrandom2_db_ = dbs_to_use_[0].db;
+    readrandom2_entries_ = static_cast<uint64_t>(FLAGS_num);
+    readrandom2_stride_ = static_cast<size_t>(FLAGS_value_size);
+
+    if (readrandom2_entries_ >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max() /
+                              readrandom2_stride_)) {
+      ErrorExit("readrandom2 working-set size overflow");
+    }
+
+    readrandom2_bytes_ =
+        static_cast<size_t>(readrandom2_entries_) * readrandom2_stride_;
+
+    void* mapping = mmap(nullptr, readrandom2_bytes_, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+      readrandom2_data_ = nullptr;
+      ErrorExit("readrandom2 mmap failed");
+    }
+    readrandom2_data_ = static_cast<char*>(mapping);
+
+    int loader_threads = std::max(1, FLAGS_threads);
+    if (readrandom2_entries_ < static_cast<uint64_t>(loader_threads)) {
+      loader_threads = static_cast<int>(readrandom2_entries_);
+    }
+
+    fprintf(stderr, "Starting %d parallel Speedb value loaders\n",
+            loader_threads);
+    fflush(stderr);
+
+    std::vector<std::thread> loaders;
+    std::vector<uint64_t> loaded(static_cast<size_t>(loader_threads), 0);
+    std::atomic<bool> load_failed(false);
+    loaders.reserve(static_cast<size_t>(loader_threads));
+
+    for (int loader_id = 0; loader_id < loader_threads; ++loader_id) {
+      loaders.emplace_back([&, loader_id]() {
+        const uint64_t begin =
+            readrandom2_entries_ * static_cast<uint64_t>(loader_id) /
+            static_cast<uint64_t>(loader_threads);
+        const uint64_t end =
+            readrandom2_entries_ * static_cast<uint64_t>(loader_id + 1) /
+            static_cast<uint64_t>(loader_threads);
+
+        ReadOptions options = read_options_;
+        options.adaptive_readahead = FLAGS_adaptive_readahead;
+        options.async_io = FLAGS_async_io;
+
+        std::unique_ptr<const char[]> start_guard;
+        Slice start_key = AllocateKey(&start_guard);
+        GenerateKeyFromInt(begin, FLAGS_num, &start_key);
+
+        std::unique_ptr<const char[]> end_guard;
+        Slice end_key;
+        if (end < readrandom2_entries_) {
+          end_key = AllocateKey(&end_guard);
+          GenerateKeyFromInt(end, FLAGS_num, &end_key);
+        }
+
+        std::unique_ptr<Iterator> iter(readrandom2_db_->NewIterator(options));
+        iter->Seek(start_key);
+
+        uint64_t destination_index = begin;
+        while (destination_index < end && iter->Valid()) {
+          if (end < readrandom2_entries_ &&
+              iter->key().compare(end_key) >= 0) {
+            break;
+          }
+
+          const Slice value = iter->value();
+          char* destination =
+              readrandom2_data_ + destination_index * readrandom2_stride_;
+          const size_t copied = std::min(value.size(), readrandom2_stride_);
+
+          memcpy(destination, value.data(), copied);
+          if (copied < readrandom2_stride_) {
+            memset(destination + copied, 0, readrandom2_stride_ - copied);
+          }
+
+          ++destination_index;
+          iter->Next();
+        }
+
+        loaded[static_cast<size_t>(loader_id)] = destination_index - begin;
+
+        if (!iter->status().ok()) {
+          fprintf(stderr, "Speedb loader %d failed: %s\n", loader_id,
+                  iter->status().ToString().c_str());
+          load_failed.store(true, std::memory_order_relaxed);
+        }
+        if (destination_index != end) {
+          fprintf(stderr,
+                  "Speedb loader %d loaded %" PRIu64
+                  " values; expected %" PRIu64 "\n",
+                  loader_id, destination_index - begin, end - begin);
+          load_failed.store(true, std::memory_order_relaxed);
+        }
+      });
+    }
+
+    for (auto& loader : loaders) {
+      loader.join();
+    }
+
+    uint64_t total_loaded = 0;
+    for (uint64_t count : loaded) {
+      total_loaded += count;
+    }
+
+    if (load_failed.load(std::memory_order_relaxed) ||
+        total_loaded != readrandom2_entries_) {
+      fprintf(stderr,
+              "readrandom2 loaded %" PRIu64 " of %" PRIu64 " values\n",
+              total_loaded, readrandom2_entries_);
+      ReleaseReadRandom2();
+      ErrorExit("readrandom2 failed to load the complete working set");
+    }
+
+    fprintf(stdout, "ReadRandom2 loaded entries: %" PRIu64 "\n",
+            readrandom2_entries_);
+    fprintf(stdout, "ReadRandom2 value stride: %zu bytes\n",
+            readrandom2_stride_);
+    fprintf(stdout, "ReadRandom2 working set: %.3f GiB\n",
+            static_cast<double>(readrandom2_bytes_) / 1073741824.0);
+    fflush(stdout);
+  }
+
+  void ReadRandom2Barrier(SharedState* shared) {
+    MutexLock lock(&shared->mu);
+    const int generation = shared->phase_generation;
+
+    ++shared->phase_arrived;
+    if (shared->phase_arrived == shared->total) {
+      shared->phase_arrived = 0;
+      ++shared->phase_generation;
+      shared->cv.SignalAll();
+    } else {
+      while (generation == shared->phase_generation) {
+        shared->cv.Wait();
+      }
     }
   }
 
@@ -4202,6 +4390,10 @@ class Benchmark {
                   FLAGS_block_cache_trace_file.c_str());
         }
 
+        if (name == "readrandom2") {
+          PrepareReadRandom2();
+        }
+
         if (num_warmup > 0) {
           printf("Warming up benchmark by running %d times\n", num_warmup);
         }
@@ -4226,6 +4418,10 @@ class Benchmark {
         }
         if (num_repeat > 1) {
           combined_stats.ReportFinal(name);
+        }
+
+        if (name == "readrandom2") {
+          ReleaseReadRandom2();
         }
       }
       if (post_process_method != nullptr) {
@@ -6647,131 +6843,138 @@ class Benchmark {
   }
 
   void ReadRandom2(ThreadState* thread) {
-    for (const auto& db_with_cfh : dbs_to_use_) {
-      ReadRandom2(thread, db_with_cfh.db);
-    }
-  }
-  
-  void ReadRandom2(ThreadState* thread, DB* db) {
-    ReadOptions options = read_options_;
-    std::unique_ptr<char[]> ts_guard;
-    Slice ts;
-    if (user_timestamp_size_ > 0) {
-      ts_guard.reset(new char[user_timestamp_size_]);
-      ts = mock_app_clock_->GetTimestampForRead(thread->rand, ts_guard.get());
-      options.timestamp = &ts;
+    if (readrandom2_data_ == nullptr || readrandom2_db_ == nullptr ||
+        readrandom2_entries_ == 0) {
+      ErrorExit("readrandom2 working set is not prepared");
     }
 
-    options.adaptive_readahead = FLAGS_adaptive_readahead;
-    options.async_io = FLAGS_async_io;
+    SharedState* shared = thread->shared;
+    const uint64_t thread_count = static_cast<uint64_t>(shared->total);
+    const uint64_t thread_id = static_cast<uint64_t>(thread->tid);
 
-    // std::vector<std::string> readvec;
-    std::string *readvec = new std::string[FLAGS_num];
-    Iterator* iter = db->NewIterator(options);
-    int i = 0, found = 0;
+    const uint64_t shard_begin =
+        readrandom2_entries_ * thread_id / thread_count;
+    const uint64_t shard_end =
+        readrandom2_entries_ * (thread_id + 1) / thread_count;
+    const uint64_t shard_size = shard_end - shard_begin;
 
-    struct timeval starttime, endtime;
-    // Prepare all the values in memory
-    for (iter->SeekToFirst(); i < FLAGS_num && iter->Valid(); iter->Next()) {
-      // readvec.push_back(iter->value().ToString());
-      readvec[i] = iter->value().ToString();
-      ++i;
-
-      if (thread->shared->read_rate_limiter.get() != nullptr &&
-         i % 1024 == 1023) {
-        thread->shared->read_rate_limiter->Request(1024, Env::IO_HIGH,
-                                                  nullptr /* stats */,
-                                                  RateLimiter::OpType::kRead);
-      }
-
+    if (shard_size == 0) {
+      ErrorExit("readrandom2 has more benchmark threads than entries");
     }
 
-    delete iter;
-
-    //	std::cout << "Allocation finishes. Press Enter to continue." << std::endl;
-    //	getchar();
-    fprintf(stderr, "signalling readyness to /tmp/enablement/speedb_watch\n");
-    FILE *fd2 = fopen("/tmp/enablement/speedb_watch", "w+");
-
-    if (fd2 == NULL) {
-        fprintf (stderr, "ERROR: could not create the shared memory file descriptor\n");
-        fprintf (stderr, "Automatic scheme invocation not available\n");
-    }
-    else {
-        fprintf(fd2, "%lu\n", (unsigned long) time(NULL));
-        fclose(fd2);
+    const uint64_t hot_begin = shard_begin + shard_size * 70ULL / 100ULL;
+    uint64_t hot_count = shard_size * 20ULL / 100ULL;
+    if (hot_count == 0) {
+      hot_count = shard_end - hot_begin;
     }
 
-    usleep(250);
+    uint64_t thread_reads = static_cast<uint64_t>(reads_) / thread_count;
+    if (thread_id < static_cast<uint64_t>(reads_) % thread_count) {
+      ++thread_reads;
+    }
 
-    std::cout << "First 2 runs for warming up." << std::endl;
-    srand(1234);
-    uint64_t lfsr = rand();
-    // First run for warming up
-    i = 0;
-    for ( int j = 0; j < 2; ++j) {
-      for ( ; i < reads_; ++i) {
-        int64_t access_idx;
-        if (lfsr_fast(lfsr) % 100 < 80) {
-          // Access the hot region
+    uint64_t lfsr =
+        1234ULL + (thread_id + 1ULL) * 0x9e3779b97f4a7c15ULL;
+
+    if (thread_id == 0) {
+      fprintf(stdout, "First 2 runs for warming up.\n");
+      fflush(stdout);
+    }
+
+    for (int iteration = 0; iteration < 2; ++iteration) {
+      for (uint64_t operation = 0; operation < thread_reads; ++operation) {
+        uint64_t access_idx;
+
+        lfsr = lfsr_fast(lfsr);
+        if (lfsr % 100ULL < 80ULL) {
           lfsr = lfsr_fast(lfsr);
-          //	access_idx = GetRandomKey(&thread->rand) % (int64_t(0.2 * FLAGS_num)) + int64_t(0.7 * FLAGS_num);
-	  access_idx = lfsr % (int64_t(0.2 * FLAGS_num)) + int64_t(0.5 * FLAGS_num);
+          access_idx = hot_begin + lfsr % hot_count;
         } else {
           lfsr = lfsr_fast(lfsr);
-          //	access_idx = GetRandomKey(&thread->rand);
-	  access_idx = lfsr % FLAGS_num;
+          access_idx = shard_begin + lfsr % shard_size;
         }
-        const int64_t k = access_idx;
-        volatile std::string *value = &readvec[k];
-        if (value != nullptr) {
-          // std::reverse(value->begin(), value->end());
-          std::reverse(readvec[k].begin(), readvec[k].end());
-        }
+
+        char* value =
+            readrandom2_data_ + access_idx * readrandom2_stride_;
+        std::reverse(value, value + readrandom2_stride_);
       }
     }
 
-    //	std::cout << "Warm up finishes. Press Enter to continue." << std::endl;
-    //	getchar();
+    ReadRandom2Barrier(shared);
+
+    if (thread_id == 0) {
+      fprintf(stderr,
+              "signalling readyness to /tmp/enablement/speedb_watch\n");
+      FILE* ready_file = fopen("/tmp/enablement/speedb_watch", "w+");
+      if (ready_file == nullptr) {
+        fprintf(stderr, "ERROR: could not create Speedb readiness file\n");
+      } else {
+        fprintf(ready_file, "%lu\n", static_cast<unsigned long>(time(nullptr)));
+        fclose(ready_file);
+      }
+    }
+
+    ReadRandom2Barrier(shared);
+
+    if (thread_id == 0) {
+      usleep(500000);
+    }
+
+    ReadRandom2Barrier(shared);
 
     thread->stats.Start(thread->tid);
     thread->stats.ResetLastOpTime();
 
-    // ReadRandom in memory
-    for ( int j = 0; j < 20; ++j) {
-      i = 0;
-      gettimeofday(&starttime, NULL);
-      for ( ; i < reads_; ++i) {
-        int64_t access_idx;
-        if (lfsr_fast(lfsr) % 100 < 80) {
-          // Access the hot region
+    ReadRandom2Barrier(shared);
+
+    for (int iteration = 0; iteration < 20; ++iteration) {
+      struct timeval starttime;
+      struct timeval endtime;
+
+      ReadRandom2Barrier(shared);
+
+      if (thread_id == 0) {
+        gettimeofday(&starttime, nullptr);
+      }
+
+      ReadRandom2Barrier(shared);
+
+      for (uint64_t operation = 0; operation < thread_reads; ++operation) {
+        uint64_t access_idx;
+
+        lfsr = lfsr_fast(lfsr);
+        if (lfsr % 100ULL < 80ULL) {
           lfsr = lfsr_fast(lfsr);
-          //	access_idx = GetRandomKey(&thread->rand) % (int64_t(0.2 * FLAGS_num)) + int64_t(0.7 * FLAGS_num);
-	  access_idx = lfsr % (int64_t(0.2 * FLAGS_num)) + int64_t(0.5 * FLAGS_num);
+          access_idx = hot_begin + lfsr % hot_count;
         } else {
           lfsr = lfsr_fast(lfsr);
-	  access_idx = lfsr % FLAGS_num;
-          //	access_idx = GetRandomKey(&thread->rand);
-        }
-        const int64_t k = access_idx;
-        volatile std::string *value = &readvec[k];
-        if (value != nullptr) {
-          // std::reverse(value->begin(), value->end());
-          std::reverse(readvec[k].begin(), readvec[k].end());
-          ++found;
+          access_idx = shard_begin + lfsr % shard_size;
         }
 
-        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+        char* value =
+            readrandom2_data_ + access_idx * readrandom2_stride_;
+        std::reverse(value, value + readrandom2_stride_);
+        thread->stats.FinishedOps(nullptr, readrandom2_db_, 1, kRead);
       }
-      gettimeofday(&endtime, NULL);
-      std::fflush(stdout);
-      std::fprintf(stdout, "Iteration time: %zu.%03zu\n", endtime.tv_sec - starttime.tv_sec,
-		      (endtime.tv_usec - starttime.tv_usec) / 1000);
+
+      ReadRandom2Barrier(shared);
+
+      if (thread_id == 0) {
+        gettimeofday(&endtime, nullptr);
+        const double seconds =
+            static_cast<double>(endtime.tv_sec - starttime.tv_sec) +
+            static_cast<double>(endtime.tv_usec - starttime.tv_usec) /
+                1000000.0;
+
+        fprintf(stdout, "Iteration %d time: %.6f seconds\n", iteration + 1,
+                seconds);
+        fprintf(stdout, "Iteration %d throughput: %.3f ops/sec\n",
+                iteration + 1, static_cast<double>(reads_) / seconds);
+        fflush(stdout);
+      }
+
+      ReadRandom2Barrier(shared);
     }
-    // char msg[100];
-    // snprintf(msg, sizeof(msg), "(%d of %lu found)\n", found, reads_);
-    // thread->stats.AddMessage(msg);
-    // delete [] readvec;
   }
 
   // Calls MultiGet over a list of keys from a random distribution.

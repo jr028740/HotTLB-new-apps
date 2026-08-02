@@ -120,7 +120,7 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
   g.PrintStats();
   double total_seconds = 0;
 
-  const char *perf_cmd = "/home/dmt/bench_gapbs_pr/perf_command.sh";
+  const char *perf_cmd = "/home/l1/Documents/HotTLB-new-apps/bench_gapbs_pr/perf_command.sh";
 
   Timer trial_timer;
   for (int iter=0; iter < cli.num_trials(); iter++) {

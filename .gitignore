@@ -1,0 +1,5 @@
+*venv/
+HdrHistogram_c/
+*.tar.gz
+lmdb-data/
+new-apps/

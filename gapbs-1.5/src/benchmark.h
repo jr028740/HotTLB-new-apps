@@ -17,6 +17,9 @@
 #include "util.h"
 #include "writer.h"
 
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 /*
 GAP Benchmark Suite
@@ -93,6 +96,20 @@ bool VerifyUnimplemented(...) {
   return false;
 }
 
+// Perf process
+void launch_perf(int cpid, const char* perf_cmd) {
+  // char buf[5000];
+  // sprintf(buf, perf_cmd, cpid);
+  
+
+  char pid_str[16];
+  sprintf(pid_str, "%d", cpid);
+  printf("Perf process spawned! cpid %s waiting to run %s\n", pid_str, perf_cmd);
+
+  int err = execl(perf_cmd, "perf_command.sh", "vanilla", pid_str, NULL);
+  if (err == -1) printf("Error with perf!\n");
+  // fflush(stdout);
+}
 
 // Calls (and times) kernel according to command line arguments
 template<typename GraphT_, typename GraphFunc, typename AnalysisFunc,
@@ -102,11 +119,28 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
                      VerifierFunc verify) {
   g.PrintStats();
   double total_seconds = 0;
+
+  const char *perf_cmd = "/home/l1/Documents/HotTLB-new-apps/bench_gapbs_pr/perf_command.sh";
+
   Timer trial_timer;
   for (int iter=0; iter < cli.num_trials(); iter++) {
-    trial_timer.Start();
-    auto result = kernel(g);
-    trial_timer.Stop();
+    int main_pid = getpid();
+    int cpid = fork();
+    decltype(kernel(g)) result;
+    if (cpid == 0) {
+	setpgid(0, 0);
+	printf("Main pid: %d\n", main_pid);
+        launch_perf(main_pid, perf_cmd); // child process running perf
+    } else {
+	setpgid(cpid, cpid);
+	usleep(500000);
+
+        trial_timer.Start();
+        result = kernel(g);
+        trial_timer.Stop();
+	kill(-cpid, SIGTERM); // stop perf stat
+	waitpid(cpid, NULL, 0);
+    }
     PrintTime("Trial Time", trial_timer.Seconds());
     total_seconds += trial_timer.Seconds();
     if (cli.do_analysis() && (iter == (cli.num_trials()-1)))

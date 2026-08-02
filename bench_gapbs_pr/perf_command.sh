@@ -1,21 +1,65 @@
 #!/bin/bash
+set -euo pipefail
 
-if [ -z "$1" ]
-	then echo "Provide a config (vanilla/hgpt/xhgpt) to continue."
-	exit 1
+if [[ $# -lt 1 ]]; then
+    echo "Provide a config: vanilla/thp/gemini/hottlb"
+    exit 1
 fi
 
-if [ -z "$2" ]
-	then echo "Provide a pid to continue."
-	exit 1
+if [[ $# -lt 2 ]]; then
+    echo "Provide a PID"
+    exit 1
 fi
 
+CONFIG="$1"
+MONITOR_PID="$2"
 
-datetime=$(date +'%m%d%H%M%S')
-
+DATETIME=$(date +'%m%d%H%M%S%N')
 APP_NAME="gapbs_pr"
+PERF_PATH="/home/l1/Documents/HotTLB-kernel-New/tools/perf/perf"
 
-PERF_PATH="/opt/perf"
-PERF_ITEMS="mem_inst_retired.stlb_miss_loads,mem_inst_retired.stlb_miss_stores"
+SCRIPT_DIR=$(dirname "$(realpath -e "${BASH_SOURCE[0]:-$0}")")
+OUTPUT_FILE="$SCRIPT_DIR/perf-$APP_NAME-$CONFIG.log.$DATETIME"
 
-taskset -a -c 0-1 "$PERF_PATH" stat record -e "$PERF_ITEMS" -o "./perf.data" -I 5000 -p "$2" >> "./perf-$APP_NAME-$1.log.$datetime" 2>&1
+PERF_PID=""
+
+stop_perf() {
+    trap - TERM INT
+
+    if [[ -n "$PERF_PID" ]] && kill -0 "$PERF_PID" 2>/dev/null; then
+        kill -INT "$PERF_PID" 2>/dev/null || true
+        wait "$PERF_PID" 2>/dev/null || true
+    fi
+
+    exit 0
+}
+
+trap stop_perf TERM INT
+
+if [[ ! -x "$PERF_PATH" ]]; then
+    echo "Perf binary not found or not executable: $PERF_PATH"
+    exit 1
+fi
+
+if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+    echo "PID does not exist: $MONITOR_PID"
+    exit 1
+fi
+
+setsid taskset -a -c 0-1 \
+    "$PERF_PATH" stat \
+    -p "$MONITOR_PID" \
+    -e r11d0 \
+    -e r12d0 \
+    -o "$OUTPUT_FILE" &
+
+PERF_PID=$!
+
+set +e
+wait "$PERF_PID"
+PERF_STATUS=$?
+set -e
+
+trap - TERM INT
+
+exit "$PERF_STATUS"

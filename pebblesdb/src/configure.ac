@@ -49,7 +49,7 @@ AC_PROG_CXX
 AC_PROG_CC
 AC_LANG(C++)
 
-ANAL_WARNINGS
+# ANAL_WARNINGS
 
 EXTRA_CFLAGS=""
 AX_CHECK_COMPILE_FLAG([-fno-builtin-memcmp],[EXTRA_CFLAGS="-fno-builtin-memcmp"],,)

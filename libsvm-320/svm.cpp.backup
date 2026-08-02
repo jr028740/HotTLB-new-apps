@@ -7,7 +7,6 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <locale.h>
-#include <omp.h>
 #include "svm.h"
 
 #include <sys/time.h>
@@ -1308,7 +1307,6 @@ public:
 		int start, j;
 		if((start = cache->get_data(i,&data,len)) < len)
 		{
-			#pragma omp parallel for private(j) schedule(guided)
 			for(j=start;j<len;j++)
 				data[j] = (Qfloat)(y[i]*y[j]*(this->*kernel_function)(i,j));
 		}

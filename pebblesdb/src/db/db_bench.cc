@@ -15,6 +15,8 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <fstream>
+#include <pthread.h>
+#include <vector>
 
 #include <sys/types.h>
 #include <stdio.h>
@@ -216,15 +218,15 @@ class Stats {
   double start_;
   double finish_;
   double seconds_;
-  int done_;
-  int next_report_;
+  int64_t done_;
+  int64_t next_report_;
   int64_t bytes_;
   double last_op_finish_;
   Histogram hist_;
   std::string message_;
 
  public:
-  Stats() 
+  Stats()
     : start_(),
       finish_(),
       seconds_(),
@@ -301,7 +303,11 @@ class Stats {
       else if (next_report_ < 100000) next_report_ += 10000;
       else if (next_report_ < 500000) next_report_ += 50000;
       else                            next_report_ += 100000;
-      fprintf(stderr, "... finished %d ops%30s\r", done_, "");
+      fprintf(
+          stderr,
+          "... finished %lld ops%30s\r",
+          static_cast<long long>(done_),
+          "");
       fflush(stderr);
     }
   }
@@ -344,16 +350,11 @@ struct SharedState {
   port::Mutex mu;
   port::CondVar cv;
   int total;
-
-  // Each thread goes through the following states:
-  //    (1) initializing
-  //    (2) waiting for others to be initialized
-  //    (3) running
-  //    (4) done
-
   int num_initialized;
   int num_done;
   bool start;
+  int phase_arrived;
+  int phase_generation;
 
   SharedState()
     : mu(),
@@ -361,7 +362,9 @@ struct SharedState {
       total(),
       num_initialized(),
       num_done(),
-      start() {
+      start(),
+      phase_arrived(),
+      phase_generation() {
   }
 };
 
@@ -399,6 +402,234 @@ class Benchmark {
   WriteOptions write_options_;
   int reads_;
   int heap_counter_;
+  char* readvec_;
+  uint64_t readvec_size_;
+  size_t readvec_stride_;
+  size_t readvec_bytes_;
+  struct ReadRandom2LoadArg {
+    Benchmark* benchmark;
+    uint64_t begin_entry;
+    uint64_t end_entry;
+    uint64_t loaded_entries;
+    int thread_id;
+    bool ok;
+  };
+
+  static void* ReadRandom2LoadBody(void* pointer) {
+    ReadRandom2LoadArg* arg =
+        reinterpret_cast<ReadRandom2LoadArg*>(pointer);
+
+    Iterator* iter =
+        arg->benchmark->db_->NewIterator(ReadOptions());
+
+    char start_key[32];
+    snprintf(
+        start_key,
+        sizeof(start_key),
+        "%016llu",
+        static_cast<unsigned long long>(arg->begin_entry));
+
+    iter->Seek(start_key);
+
+    uint64_t entry = arg->begin_entry;
+    arg->loaded_entries = 0;
+    arg->ok = true;
+
+    while (entry < arg->end_entry && iter->Valid()) {
+      Slice value = iter->value();
+
+      char* destination =
+          arg->benchmark->readvec_ +
+          static_cast<size_t>(entry) *
+          arg->benchmark->readvec_stride_;
+
+      memset(
+          destination,
+          0,
+          arg->benchmark->readvec_stride_);
+
+      size_t bytes = std::min(
+          value.size(),
+          static_cast<size_t>(FLAGS_value_size));
+
+      memcpy(destination, value.data(), bytes);
+
+      entry++;
+      arg->loaded_entries++;
+      iter->Next();
+    }
+
+    if (!iter->status().ok()) {
+      fprintf(
+          stderr,
+          "ReadRandom2 loader thread %d iterator error: %s\n",
+          arg->thread_id,
+          iter->status().ToString().c_str());
+      arg->ok = false;
+    }
+
+    if (entry != arg->end_entry) {
+      fprintf(
+          stderr,
+          "ReadRandom2 loader thread %d loaded %llu of %llu entries\n",
+          arg->thread_id,
+          static_cast<unsigned long long>(arg->loaded_entries),
+          static_cast<unsigned long long>(
+              arg->end_entry - arg->begin_entry));
+      arg->ok = false;
+    }
+
+    delete iter;
+    return NULL;
+  }
+
+  void ReleaseReadRandom2() {
+    if (readvec_ != NULL) {
+      munmap(readvec_, readvec_bytes_);
+    }
+
+    readvec_ = NULL;
+    readvec_size_ = 0;
+    readvec_stride_ = 0;
+    readvec_bytes_ = 0;
+  }
+
+  void PrepareReadRandom2() {
+    ReleaseReadRandom2();
+
+    readvec_size_ = static_cast<uint64_t>(FLAGS_num);
+    readvec_stride_ =
+        static_cast<size_t>(FLAGS_value_size) +
+        sizeof(std::string);
+
+    readvec_bytes_ =
+        static_cast<size_t>(readvec_size_) *
+        readvec_stride_;
+
+    void* mapping = mmap(
+        NULL,
+        readvec_bytes_,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0);
+
+    if (mapping == MAP_FAILED) {
+      perror("mmap");
+      exit(1);
+    }
+
+    readvec_ = static_cast<char*>(mapping);
+
+    int loader_threads = FLAGS_threads;
+
+    if (loader_threads < 1) {
+      loader_threads = 1;
+    }
+
+    std::vector<pthread_t> threads(loader_threads);
+    std::vector<ReadRandom2LoadArg> args(loader_threads);
+
+    for (int thread_id = 0;
+         thread_id < loader_threads;
+         thread_id++) {
+      args[thread_id].benchmark = this;
+      args[thread_id].begin_entry =
+          readvec_size_ *
+          static_cast<uint64_t>(thread_id) /
+          static_cast<uint64_t>(loader_threads);
+      args[thread_id].end_entry =
+          readvec_size_ *
+          static_cast<uint64_t>(thread_id + 1) /
+          static_cast<uint64_t>(loader_threads);
+      args[thread_id].loaded_entries = 0;
+      args[thread_id].thread_id = thread_id;
+      args[thread_id].ok = true;
+
+      int status = pthread_create(
+          &threads[thread_id],
+          NULL,
+          ReadRandom2LoadBody,
+          &args[thread_id]);
+
+      if (status != 0) {
+        fprintf(
+            stderr,
+            "pthread_create failed: %d\n",
+            status);
+        exit(1);
+      }
+    }
+
+    uint64_t total_loaded = 0;
+    bool load_ok = true;
+
+    for (int thread_id = 0;
+         thread_id < loader_threads;
+         thread_id++) {
+      int status =
+          pthread_join(threads[thread_id], NULL);
+
+      if (status != 0) {
+        fprintf(
+            stderr,
+            "pthread_join failed: %d\n",
+            status);
+        exit(1);
+      }
+
+      total_loaded += args[thread_id].loaded_entries;
+
+      if (!args[thread_id].ok) {
+        load_ok = false;
+      }
+    }
+
+    if (!load_ok || total_loaded != readvec_size_) {
+      fprintf(
+          stderr,
+          "ReadRandom2 failed to load the requested database values: "
+          "%llu of %llu loaded\n",
+          static_cast<unsigned long long>(total_loaded),
+          static_cast<unsigned long long>(readvec_size_));
+      exit(1);
+    }
+
+    fprintf(
+        stdout,
+        "ReadRandom2 loaded entries: %llu\n",
+        static_cast<unsigned long long>(readvec_size_));
+
+    fprintf(
+        stdout,
+        "ReadRandom2 stride: %zu bytes\n",
+        readvec_stride_);
+
+    fprintf(
+        stdout,
+        "ReadRandom2 working set: %.3f GiB\n",
+        static_cast<double>(readvec_bytes_) /
+        1073741824.0);
+
+    fflush(stdout);
+  }
+
+  void ReadRandom2Barrier(SharedState* shared) {
+    MutexLock lock(&shared->mu);
+
+    const int generation = shared->phase_generation;
+    shared->phase_arrived++;
+
+    if (shared->phase_arrived == shared->total) {
+      shared->phase_arrived = 0;
+      shared->phase_generation++;
+      shared->cv.SignalAll();
+    } else {
+      while (generation == shared->phase_generation) {
+        shared->cv.Wait();
+      }
+    }
+  }
 
   DBImpl* dbfull() {
     return reinterpret_cast<DBImpl*>(db_);
@@ -479,34 +710,41 @@ class Benchmark {
   }
 
  public:
-  Benchmark()
-  : cache_(FLAGS_cache_size >= 0 ? NewLRUCache(FLAGS_cache_size) : NULL),
+ Benchmark()
+   : cache_(FLAGS_cache_size >= 0 ? NewLRUCache(FLAGS_cache_size) : NULL),
     filter_policy_(FLAGS_bloom_bits >= 0
-                   ? NewBloomFilterPolicy(FLAGS_bloom_bits)
-                   : NULL),
+                ? NewBloomFilterPolicy(FLAGS_bloom_bits)
+                : NULL),
     db_(NULL),
     num_(FLAGS_num),
     value_size_(FLAGS_value_size),
     entries_per_batch_(1),
     write_options_(),
     reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
-    heap_counter_(0) {
-    std::vector<std::string> files;
-    Env::Default()->GetChildren(FLAGS_db, &files);
-    for (size_t i = 0; i < files.size(); i++) {
-      if (Slice(files[i]).starts_with("heap-")) {
-        Env::Default()->DeleteFile(std::string(FLAGS_db) + "/" + files[i]);
-      }
-    }
-    if (!FLAGS_use_existing_db) {
-      DestroyDB(FLAGS_db, Options());
-    }
+    heap_counter_(0),
+    readvec_(NULL),
+    readvec_size_(0),
+    readvec_stride_(0),
+    readvec_bytes_(0) {
+	    std::vector<std::string> files;
+	    Env::Default()->GetChildren(FLAGS_db, &files);
+	    for (size_t i = 0; i < files.size(); i++) {
+	      if (Slice(files[i]).starts_with("heap-")) {
+	        Env::Default()->DeleteFile(std::string(FLAGS_db) + "/" + files[i]);
+	      }
+	    }
+	    if (!FLAGS_use_existing_db) {
+	      DestroyDB(FLAGS_db, Options());
+	    }
   }
 
   ~Benchmark() {
-    delete db_;
-    delete cache_;
-    delete filter_policy_;
+      if (readvec_ != NULL) {
+          munmap(readvec_, readvec_bytes_);
+      }
+      delete db_;
+      delete cache_;
+      delete filter_policy_;
   }
 
   void TryReopen() {
@@ -869,6 +1107,7 @@ class Benchmark {
 
       void (Benchmark::*method)(ThreadState*) = NULL;
       bool fresh_db = false;
+      bool release_readrandom2 = false;
       int num_threads = FLAGS_threads;
 
       if (name ==  Slice("ycsb")) {
@@ -914,6 +1153,8 @@ class Benchmark {
       } else if (name == Slice("readrandom")) {
         method = &Benchmark::ReadRandom;
       } else if (name == Slice("readrandom2")) {
+        PrepareReadRandom2();
+        release_readrandom2 = true;
         method = &Benchmark::ReadRandom2;
       } else if (name == Slice("readmissing")) {
         method = &Benchmark::ReadMissing;
@@ -995,6 +1236,10 @@ class Benchmark {
 
       if (method != NULL) {
         RunBenchmark(num_threads, name, method);
+      }
+
+      if (release_readrandom2) {
+        ReleaseReadRandom2();
       }
     }
     db_->PrintTimerAudit();
@@ -1098,6 +1343,8 @@ class Benchmark {
     shared.num_initialized = 0;
     shared.num_done = 0;
     shared.start = false;
+    shared.phase_arrived = 0;
+    shared.phase_generation = 0;
 
     ThreadArg* arg = new ThreadArg[n];
     for (int i = 0; i < n; i++) {
@@ -1372,103 +1619,237 @@ class Benchmark {
   }
 
   void ReadRandom2(ThreadState* thread) {
-    ReadOptions options;
-    // std::vector<std::string> readvec;
-    std::string *readvec = new std::string[FLAGS_num];
-    Iterator* iter = db_->NewIterator(options);
-    int i = 0, found = 0;
+    SharedState* shared = thread->shared;
 
-    struct timeval starttime, endtime;
-    // Prepare all the values in memory
-    for (iter->SeekToFirst(); i < FLAGS_num && iter->Valid(); iter->Next()) {
-      // readvec.push_back(iter->value().ToString());
-      readvec[i] = iter->value().ToString();
-      ++i;
+    const uint64_t thread_count =
+        static_cast<uint64_t>(shared->total);
+
+    const uint64_t thread_id =
+        static_cast<uint64_t>(thread->tid);
+
+    const uint64_t global_hot_begin =
+        readvec_size_ * 70ULL / 100ULL;
+
+    const uint64_t global_hot_end =
+        readvec_size_ * 90ULL / 100ULL;
+
+    const uint64_t global_hot_size =
+        global_hot_end - global_hot_begin;
+
+    const uint64_t global_cold_size =
+        readvec_size_ - global_hot_size;
+
+    const uint64_t hot_begin =
+        global_hot_begin +
+        global_hot_size * thread_id / thread_count;
+
+    const uint64_t hot_end =
+        global_hot_begin +
+        global_hot_size * (thread_id + 1ULL) / thread_count;
+
+    const uint64_t cold_begin =
+        global_cold_size * thread_id / thread_count;
+
+    const uint64_t cold_end =
+        global_cold_size * (thread_id + 1ULL) / thread_count;
+
+    const uint64_t hot_count = hot_end - hot_begin;
+    const uint64_t cold_count = cold_end - cold_begin;
+
+    if (hot_count == 0 || cold_count == 0) {
+      fprintf(
+          stderr,
+          "ReadRandom2 thread %llu received an empty access range\n",
+          static_cast<unsigned long long>(thread_id));
+      exit(1);
     }
-    delete iter;
 
-    //	std::cout << "Allocation finishes. Press Enter to continue." << std::endl;
-    //	getchar();
-    fprintf(stderr, "signalling readyness to /tmp/enablement/pebblesdb_watch\n");
-    FILE *fd2 = fopen("/tmp/enablement/pebblesdb_watch", "w+");
+    uint64_t thread_reads =
+        static_cast<uint64_t>(reads_) /
+        thread_count;
 
-    if (fd2 == NULL) {
-        fprintf (stderr, "ERROR: could not create the shared memory file descriptor\n");
-        fprintf (stderr, "Automatic scheme invocation not available\n");
-    }
-    else {
-        fprintf(fd2, "%lu\n", (unsigned long) time(NULL));
-        fclose(fd2);
+    if (thread_id <
+        static_cast<uint64_t>(reads_) %
+        thread_count) {
+      thread_reads++;
     }
 
-    usleep(250);
+    uint64_t lfsr =
+        1234ULL +
+        (thread_id + 1ULL) *
+        0x9e3779b97f4a7c15ULL;
 
-    std::cout << "First 2 runs for warming up." << std::endl;
-    // First run for warming up
-    srand(1234);
-    uint64_t lfsr = rand();
-    i = 0;
-    for ( int j = 0; j < 2; ++j) {
-      for (; i < reads_; ++i) {
+    if (thread_id == 0) {
+      fprintf(stdout, "First 2 runs for warming up.\n");
+      fflush(stdout);
+    }
+
+    for (int iteration = 0;
+         iteration < 2;
+         iteration++) {
+      for (uint64_t operation = 0;
+           operation < thread_reads;
+           operation++) {
         uint64_t access_idx;
-        if (lfsr_fast(lfsr) % 100 < 80) {
-          // Access the hot region
+
+        lfsr = lfsr_fast(lfsr);
+
+        if (lfsr % 100ULL < 80ULL) {
           lfsr = lfsr_fast(lfsr);
-          access_idx = lfsr % int(0.2 * FLAGS_num) + int(0.7 * FLAGS_num);
+          access_idx =
+              hot_begin +
+              lfsr % hot_count;
         } else {
           lfsr = lfsr_fast(lfsr);
-          access_idx = lfsr % FLAGS_num;
+
+          uint64_t logical_cold_index =
+              cold_begin +
+              lfsr % cold_count;
+
+          if (logical_cold_index < global_hot_begin) {
+            access_idx = logical_cold_index;
+          } else {
+            access_idx =
+                logical_cold_index +
+                global_hot_size;
+          }
         }
-        const uint64_t k = access_idx;
-        std::string *value = &readvec[k];
-        if (value != nullptr) {
-          // std::reverse(value->begin(), value->end());
-	  std::reverse(readvec[k].begin(), readvec[k].end());
-        }
+
+        char* value =
+            readvec_ +
+            static_cast<size_t>(access_idx) *
+            readvec_stride_;
+
+        std::reverse(
+            value,
+            value + FLAGS_value_size);
       }
     }
 
-    //	std::cout << "Warm up finishes. Press Enter to continue." << std::endl;
-    //	getchar();
+    ReadRandom2Barrier(shared);
 
-    // Do not count any of the loading work/delay in stats.
+    if (thread_id == 0) {
+      fprintf(
+          stderr,
+          "signalling readyness to "
+          "/tmp/enablement/pebblesdb_watch\n");
+
+      FILE* ready_file =
+          fopen(
+              "/tmp/enablement/pebblesdb_watch",
+              "w+");
+
+      if (ready_file == NULL) {
+        fprintf(
+            stderr,
+            "ERROR: could not create readiness file\n");
+      } else {
+        fprintf(
+            ready_file,
+            "%lu\n",
+            static_cast<unsigned long>(time(NULL)));
+        fclose(ready_file);
+      }
+    }
+
+    ReadRandom2Barrier(shared);
+
+    if (thread_id == 0) {
+      usleep(500000);
+    }
+
+    ReadRandom2Barrier(shared);
+
     thread->stats.Start();
 
-    for ( int j = 0; j < 20; ++j) {
+    ReadRandom2Barrier(shared);
 
-      i = 0;
-      //	std::cout << "=====Iteration" << 1 + j << "=====" << std::endl;
-      gettimeofday(&starttime, NULL);
-      // ReadRandom in memory
-      for ( ; i < reads_; ++i) {
-        int access_idx;
-        if (lfsr_fast(lfsr) % 100 < 80) {
-          // Access the hot region
+    for (int iteration = 0;
+         iteration < 20;
+         iteration++) {
+      struct timeval starttime;
+      struct timeval endtime;
+
+      ReadRandom2Barrier(shared);
+
+      if (thread_id == 0) {
+        gettimeofday(&starttime, NULL);
+      }
+
+      ReadRandom2Barrier(shared);
+
+      for (uint64_t operation = 0;
+           operation < thread_reads;
+           operation++) {
+        uint64_t access_idx;
+
+        lfsr = lfsr_fast(lfsr);
+
+        if (lfsr % 100ULL < 80ULL) {
           lfsr = lfsr_fast(lfsr);
-          access_idx = lfsr % int(0.2 * FLAGS_num) + int(0.7 * FLAGS_num);
+          access_idx =
+              hot_begin +
+              lfsr % hot_count;
         } else {
           lfsr = lfsr_fast(lfsr);
-          // access_idx = thread->rand.Uniform(FLAGS_num);
-          access_idx = lfsr % FLAGS_num;
+
+          uint64_t logical_cold_index =
+              cold_begin +
+              lfsr % cold_count;
+
+          if (logical_cold_index < global_hot_begin) {
+            access_idx = logical_cold_index;
+          } else {
+            access_idx =
+                logical_cold_index +
+                global_hot_size;
+          }
         }
-        const int k = access_idx;
-        std::string *value = &readvec[k];
-        if (value != nullptr) {
-          // std::reverse(value->begin(), value->end());
-	  std::reverse(readvec[k].begin(), readvec[k].end());
-          ++found;
-        }
+
+        char* value =
+            readvec_ +
+            static_cast<size_t>(access_idx) *
+            readvec_stride_;
+
+        std::reverse(
+            value,
+            value + FLAGS_value_size);
+
         thread->stats.FinishedSingleOp();
       }
-      gettimeofday(&endtime, NULL);
-      std::fflush(stdout);
-      std::fprintf(stdout, "Iteration time: %zu.%03zu\n", endtime.tv_sec - starttime.tv_sec,
-                      (endtime.tv_usec - starttime.tv_usec) / 1000);
+
+      ReadRandom2Barrier(shared);
+
+      if (thread_id == 0) {
+        gettimeofday(&endtime, NULL);
+
+        double seconds =
+            static_cast<double>(
+                endtime.tv_sec -
+                starttime.tv_sec) +
+            static_cast<double>(
+                endtime.tv_usec -
+                starttime.tv_usec) /
+            1000000.0;
+
+        fprintf(
+            stdout,
+            "Iteration %d time: %.6f seconds\n",
+            iteration + 1,
+            seconds);
+
+        fprintf(
+            stdout,
+            "Iteration %d throughput: %.3f ops/sec\n",
+            iteration + 1,
+            static_cast<double>(reads_) /
+            seconds);
+
+        fflush(stdout);
+      }
+
+      ReadRandom2Barrier(shared);
     }
-    // char msg[100];
-    // std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
-    // thread->stats.AddMessage(msg);
-    delete [] readvec;
   }
 
   void ReadMissing(ThreadState* thread) {
